@@ -30,7 +30,7 @@ BRANCH = $(shell git rev-parse --abbrev-ref HEAD)
 
 # The version of make for OSX doesn't allow us to export, so
 # we add these variables to the env in each invocation.
-GOENV = PATH=$$PATH:$(GOPATH)/bin GLIDE_HOME=$(GOPATH)/.glide
+GOENV = PATH=$$PATH:$(GOPATH)/bin
 
 # Our target binary is for Linux.  To build an exec for your local (non-linux)
 # machine, use go build directly.
@@ -45,7 +45,7 @@ LD_FLAGS = '-X main.Version=$(VERSION) -X main.Commit=$(COMMIT)'
 
 # gometalinter allows us to have a single target that runs multiple linters in
 # the same fashion.  This variable controls which linters are used.
-LINTER_FLAGS = --vendor --disable-all --enable=vet --enable=vetshadow --enable=golint --enable=ineffassign --enable=goconst --enable=deadcode --enable=dupl --enable=varcheck --enable=gocyclo --enable=misspell -i "simplivity" --deadline=240s
+LINTER_FLAGS = --disable-all --enable=vet --enable=vetshadow --enable=golint --enable=ineffassign --enable=goconst --enable=dupl --enable=gocyclo --deadline=240s
 
 # list of packages
 PACKAGE_LIST =   $(shell export $(GOENV) && go list ./$(PKG_PATH)...| grep -v vendor)
@@ -62,7 +62,6 @@ help:
 	@echo "Targets:"
 	@echo "    tools          - Download and install go tooling required to build."
 	@echo "    vendor         - Download dependencies."
-	@echo "    vendup         - Download updated dependencies. (glide up)"
 	@echo "    lint           - Static analysis of source code.  Note that this must pass in order to build."
 	@echo "    test           - Run unit tests."
 	@echo "    int            - Run integration tests.  (Not implemented yet)."
@@ -100,22 +99,12 @@ container_all: debug packages test
 
 .PHONY: tools
 tools: ; $(info $(A1) gettools)
-	@echo "$(A2) get gometalinter"
-	go get -u github.com/alecthomas/gometalinter
-	@echo "$(A2) install gometalinter"
-	export $(GOENV) && gometalinter --install
-	@echo "$(A2) get glide"
-	go get -u github.com/Masterminds/glide
-	@echo "$(S0)"
-
-vendup: tools; $(info $(A1) vendup)
-	@echo "$(A2) glide up -v"
-	export $(GOENV) && glide up -v
-	@echo "$(S0)"
+	@echo "$(A2) get golangci-lint"
+	go get -u github.com/golangci/golangci-lint/cmd/golangci-lint
 
 vendor: tools; $(info $(A1) vendor)
-	@echo "$(A2) glide install -v"
-	export $(GOENV) && glide install -v
+	@echo "$(A2) go mod vendor"
+	go mod vendor
 	@echo "$(S0)"
 
 build: ; $(info $(A1) mkdir build)
@@ -123,10 +112,10 @@ build: ; $(info $(A1) mkdir build)
 	@echo "$(S0)"
 
 .PHONY: lint
-lint: vendor; $(info $(A1) lint)
-	@echo "$(A2) lint $(PKG_PATH)"
-	export $(GOENV) $(BUILD_ENV) && gometalinter $(LINTER_FLAGS) $(PKG_PATH)... --exclude $(VEN_PATH)...
-	@echo "$(S0)"
+lint:
+	@echo "Running lint"
+	@go version
+	export $(GOENV) $(BUILD_ENV) && golangci-lint run $(LINTER_FLAGS) --exclude vendor
 
 .PHONY: clean
 clean: ; $(info $(A1) clean)

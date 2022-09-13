@@ -16,7 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/opentracing/opentracing-go"
+	otLog "github.com/opentracing/opentracing-go/log"
 	log "github.com/sirupsen/logrus"
+	"github.com/uber/jaeger-client-go/config"
 	"golang.org/x/crypto/ssh/terminal"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -28,7 +31,7 @@ const (
 	MaxFilesLimit      = 20
 	DefaultMaxLogSize  = 100  // in MB
 	MaxLogSizeLimit    = 1024 // in MB
-	JsonFormat         = "json"
+	JSONFormat         = "json"
 	TextFormat         = "text"
 )
 
@@ -39,6 +42,12 @@ type LogParams struct {
 	MaxFiles   int
 	MaxSizeMiB int
 	Format     string
+}
+
+type Logr struct {
+	ctx      context.Context
+	logEntry *log.Entry
+	cl       io.Closer
 }
 
 var (
@@ -121,7 +130,7 @@ func (l LogParams) GetLogFormat() string {
 }
 
 func (l LogParams) UseJsonFormatter() bool {
-	return l.Format == JsonFormat
+	return l.Format == JSONFormat
 }
 
 func (l LogParams) UseTextFormatter() bool {
@@ -163,8 +172,28 @@ func updateLogParamsFromEnv() {
 	}
 }
 
+//Initalizes opentracing tracing
+func InitOpentracing(service string) (opentracing.Tracer, io.Closer) {
+	cfg := &config.Configuration{
+		ServiceName: service,
+		Sampler: &config.SamplerConfig{
+			Type:  "const",
+			Param: 1,
+		},
+		Reporter: &config.ReporterConfig{
+			LogSpans: true,
+		},
+	}
+	//add tracer as a input of NewTracer so that the logspans declared true above will work
+	tracer, closer, err := cfg.NewTracer()
+	if err != nil {
+		panic(fmt.Sprintf("ERROR: cannot init tracing: %v\n", err))
+	}
+	return tracer, closer
+}
+
 // Initialize logging with given params
-func InitLogging(logName string, params *LogParams, alsoLogToStderr bool) (err error) {
+func InitLogging(logName string, params *LogParams, alsoLogToStderr bool, initTracing bool) (err error, l *Logr) {
 	initMutex.Lock()
 	defer initMutex.Unlock()
 
@@ -190,23 +219,27 @@ func InitLogging(logName string, params *LogParams, alsoLogToStderr bool) (err e
 	// No output except for the hooks
 	log.SetOutput(ioutil.Discard)
 
+	//Default Logr
+	logEntry := sourced()
+	lg := Logr{nil, logEntry, nil}
+
 	if logParams.GetFile() != "" {
 		err = AddFileHook()
 		if err != nil {
-			return err
+			return err, &lg
 		}
 	}
 	if alsoLogToStderr {
 		err = AddConsoleHook()
 		if err != nil {
-			return err
+			return err, &lg
 		}
 	}
 
 	// Set log level
 	level, err := log.ParseLevel(logParams.GetLevel())
 	if err != nil {
-		return err
+		return err, &lg
 	}
 	log.SetLevel(level)
 
@@ -217,7 +250,64 @@ func InitLogging(logName string, params *LogParams, alsoLogToStderr bool) (err e
 		"alsoLogToStderr": alsoLogToStderr,
 	}).Info("Initialized logging.")
 
-	return nil
+	//initializes tracing capabilites if true
+	if initTracing {
+		//Initializing the tracer
+		tracer, closer := InitOpentracing("CSI-Driver")
+		opentracing.SetGlobalTracer(tracer)
+
+		//Span Initialized with default context
+		span := tracer.StartSpan("CSI-Driver")
+		log.Tracef("Span Context --- Traceid:Spanid:ParentSpanid:Flags  : %v", span.Context())
+		ctx := opentracing.ContextWithSpan(context.Background(), span)
+		logEntry := sourced()
+		l := Logr{ctx, logEntry, closer}
+
+		l.LogToTrace("Info", "Tracing Initialized")
+		defer span.Finish()
+
+		return nil, &l
+	}
+
+	return nil, &lg
+}
+
+func (l *Logr) CloseTracer() {
+	l.cl.Close()
+}
+
+//Logs given string to tracer
+func (l *Logr) LogToTrace(level, msg string) {
+	span := opentracing.SpanFromContext(l.ctx)
+	//fmt.Print("In LogToTrace")
+	if span != nil {
+		span.LogFields(otLog.String("event", msg))
+	}
+	if span == nil {
+		fmt.Print("Span is nil")
+	}
+	span.Finish()
+}
+
+//Sets context of called Logr to given context
+func (l *Logr) SetContext(context context.Context) {
+	l.ctx = context
+}
+
+//Starts and returns a span for the inputted Logr
+func (l *Logr) StartContext(spanName string) (s opentracing.Span) {
+	s = opentracing.SpanFromContext(l.ctx)
+	if s == nil || s.BaggageItem(spanName) == "" {
+		s = opentracing.StartSpan(spanName)
+		s.SetBaggageItem(spanName, "true")
+		l.ctx = opentracing.ContextWithSpan(context.Background(), s)
+	}
+	return s
+}
+
+//Ends the inputted span
+func EndContext(span opentracing.Span) {
+	span.Finish()
 }
 
 func AddConsoleHook() error {
@@ -455,7 +545,6 @@ func IsSensitive(key string) bool {
 		"token",
 		"accesskey",
 		"passphrase",
-
 	}
 	key = strings.ToLower(key)
 	for _, bad := range badWords {
@@ -506,14 +595,26 @@ func sourced() *log.Entry {
 	return log.WithField("file", fmt.Sprintf("%s:%d", file, line))
 }
 
-// Trace logs a message at level Trace on the standard logger.
 func Trace(args ...interface{}) {
 	sourced().Trace(args...)
 }
 
-// Debug logs a message at level Debug on the standard logger.
+// Trace logs a message at level Trace on the standard logger.
+func (l *Logr) Trace(args ...interface{}) {
+	l.logEntry.Trace(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Trace", str)
+}
+
 func Debug(args ...interface{}) {
-	sourced().Debug(args...)
+	sourced().Trace(args...)
+}
+
+// Debug logs a message at level Debug on the standard logger.
+func (l *Logr) Debug(args ...interface{}) {
+	l.logEntry.Debug(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Debug", str)
 }
 
 // Print logs a message at level Info on the standard logger.
@@ -521,9 +622,21 @@ func Print(args ...interface{}) {
 	sourced().Print(args...)
 }
 
-// Info logs a message at level Info on the standard logger.
+func (l *Logr) Print(args ...interface{}) {
+	l.logEntry.Print(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Print", str)
+}
+
 func Info(args ...interface{}) {
-	sourced().Info(args...)
+	sourced().Trace(args...)
+}
+
+// Info logs a message at level Info on the standard logger.
+func (l *Logr) Info(args ...interface{}) {
+	l.logEntry.Info(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Info", str)
 }
 
 // Warn logs a message at level Warn on the standard logger.
@@ -531,9 +644,21 @@ func Warn(args ...interface{}) {
 	sourced().Warn(args...)
 }
 
+func (l *Logr) Warn(args ...interface{}) {
+	l.logEntry.Warn(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Warn", str)
+}
+
 // Warning logs a message at level Warn on the standard logger.
 func Warning(args ...interface{}) {
 	sourced().Warning(args...)
+}
+
+func (l *Logr) Warning(args ...interface{}) {
+	l.logEntry.Warning(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Warning", str)
 }
 
 // Error logs a message at level Error on the standard logger.
@@ -541,14 +666,31 @@ func Error(args ...interface{}) {
 	sourced().Error(args...)
 }
 
+func (l *Logr) Error(args ...interface{}) {
+	l.logEntry.Error(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Error", str)
+}
+
 // Panic logs a message at level Panic on the standard logger.
 func Panic(args ...interface{}) {
 	sourced().Panic(args...)
 }
 
+func (l *Logr) Panic(args ...interface{}) {
+	l.logEntry.Panic(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Panic", str)
+}
+
 // Fatal logs a message at level Fatal on the standard logger then the process will exit with status set to 1.
 func Fatal(args ...interface{}) {
 	sourced().Fatal(args...)
+}
+func (l *Logr) Fatal(args ...interface{}) {
+	l.logEntry.Fatal(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Fatal", str)
 }
 
 // Tracef logs a message at level Trace on the standard logger.
@@ -556,9 +698,21 @@ func Tracef(format string, args ...interface{}) {
 	sourced().Tracef(format, args...)
 }
 
+func (l *Logr) Tracef(format string, args ...interface{}) {
+	l.logEntry.Tracef(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Tracef", str)
+}
+
 // Debugf logs a message at level Debug on the standard logger.
 func Debugf(format string, args ...interface{}) {
 	sourced().Debugf(format, args...)
+}
+
+func (l *Logr) Debugf(format string, args ...interface{}) {
+	l.logEntry.Debugf(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Debugf", str)
 }
 
 // Printf logs a message at level Info on the standard logger.
@@ -566,9 +720,21 @@ func Printf(format string, args ...interface{}) {
 	sourced().Printf(format, args...)
 }
 
+func (l *Logr) Printf(format string, args ...interface{}) {
+	l.logEntry.Printf(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Printf", str)
+}
+
 // Infof logs a message at level Info on the standard logger.
 func Infof(format string, args ...interface{}) {
 	sourced().Infof(format, args...)
+}
+
+func (l *Logr) Infof(format string, args ...interface{}) {
+	l.logEntry.Infof(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Infof", str)
 }
 
 // Warnf logs a message at level Warn on the standard logger.
@@ -576,9 +742,21 @@ func Warnf(format string, args ...interface{}) {
 	sourced().Warnf(format, args...)
 }
 
+func (l *Logr) Warnf(format string, args ...interface{}) {
+	l.logEntry.Warnf(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Warnf", str)
+}
+
 // Warningf logs a message at level Warn on the standard logger.
 func Warningf(format string, args ...interface{}) {
 	sourced().Warningf(format, args...)
+}
+
+func (l *Logr) Warningf(format string, args ...interface{}) {
+	l.logEntry.Warningf(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Warningf", str)
 }
 
 // Errorf logs a message at level Error on the standard logger.
@@ -586,9 +764,21 @@ func Errorf(format string, args ...interface{}) {
 	sourced().Errorf(format, args...)
 }
 
+func (l *Logr) Errorf(format string, args ...interface{}) {
+	l.logEntry.Errorf(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Errorf", str)
+}
+
 // Panicf logs a message at level Panic on the standard logger.
 func Panicf(format string, args ...interface{}) {
 	sourced().Panicf(format, args...)
+}
+
+func (l *Logr) Panicf(format string, args ...interface{}) {
+	l.logEntry.Panicf(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Panicf", str)
 }
 
 // Fatalf logs a message at level Fatal on the standard logger then the process will exit with status set to 1.
@@ -596,9 +786,21 @@ func Fatalf(format string, args ...interface{}) {
 	sourced().Fatalf(format, args...)
 }
 
+func (l *Logr) Fatalf(format string, args ...interface{}) {
+	l.logEntry.Fatalf(format, args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Fatalf", str)
+}
+
 // Traceln logs a message at level Trace on the standard logger.
 func Traceln(args ...interface{}) {
 	sourced().Traceln(args...)
+}
+
+func (l *Logr) Traceln(args ...interface{}) {
+	l.logEntry.Traceln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Traceln", str)
 }
 
 // Debugln logs a message at level Debug on the standard logger.
@@ -606,9 +808,21 @@ func Debugln(args ...interface{}) {
 	sourced().Debugln(args...)
 }
 
+func (l *Logr) Debugln(args ...interface{}) {
+	l.logEntry.Debugln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Debugln", str)
+}
+
 // Println logs a message at level Info on the standard logger.
 func Println(args ...interface{}) {
 	sourced().Println(args...)
+}
+
+func (l *Logr) Println(args ...interface{}) {
+	l.logEntry.Println(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Println", str)
 }
 
 // Infoln logs a message at level Info on the standard logger.
@@ -616,9 +830,21 @@ func Infoln(args ...interface{}) {
 	sourced().Infoln(args...)
 }
 
+func (l *Logr) Infoln(args ...interface{}) {
+	l.logEntry.Infoln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Infoln", str)
+}
+
 // Warnln logs a message at level Warn on the standard logger.
 func Warnln(args ...interface{}) {
 	sourced().Warnln(args...)
+}
+
+func (l *Logr) Warnln(args ...interface{}) {
+	l.logEntry.Warnln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Warnln", str)
 }
 
 // Warningln logs a message at level Warn on the standard logger.
@@ -626,9 +852,21 @@ func Warningln(args ...interface{}) {
 	sourced().Warningln(args...)
 }
 
+func (l *Logr) Warningln(args ...interface{}) {
+	l.logEntry.Warningln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Warningln", str)
+}
+
 // Errorln logs a message at level Error on the standard logger.
 func Errorln(args ...interface{}) {
 	sourced().Errorln(args...)
+}
+
+func (l *Logr) Errorln(args ...interface{}) {
+	l.logEntry.Errorln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Errorln", str)
 }
 
 // Panicln logs a message at level Panic on the standard logger.
@@ -636,7 +874,19 @@ func Panicln(args ...interface{}) {
 	sourced().Panicln(args...)
 }
 
+func (l *Logr) Panicln(args ...interface{}) {
+	l.logEntry.Panicln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Panicln", str)
+}
+
 // Fatalln logs a message at level Fatal on the standard logger then the process will exit with status set to 1.
 func Fatalln(args ...interface{}) {
 	sourced().Fatalln(args...)
+}
+
+func (l *Logr) Fatalln(args ...interface{}) {
+	l.logEntry.Fatalln(args...)
+	str := fmt.Sprintf("%v", args)
+	l.LogToTrace("Fatalln", str)
 }
