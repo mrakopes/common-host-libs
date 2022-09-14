@@ -330,7 +330,8 @@ func RetryCreateFileSystemWithOptions(devPath string, fsType string, options []s
 
 // CheckFileSystem: checks file system on the device for errors
 func CheckFileSystem(devPath string) (err error) {
-	log.Tracef("checkFileSystem called with %s", devPath)
+	log.Tracef(">>>>> CheckFileSystem,  devicePath: %s", devPath)
+	defer log.Trace("<<<<< CheckFileSystem")
 	return checkFileSystem(devPath)
 }
 
