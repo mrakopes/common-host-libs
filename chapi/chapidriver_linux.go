@@ -248,7 +248,8 @@ func (driver *LinuxDriver) MountNFSVolume(source string, targetPath string, moun
 
 // MountDevice mounts the given device to the given mount point. This must be idempotent.
 func (driver *LinuxDriver) MountDevice(device *model.Device, mountPoint string, mountOptions []string, fsOpts *model.FilesystemOpts) (*model.Mount, error) {
-	log.Tracef(">>>>> MountDevice, device: %+v, mountPoint: %s, mountOptions: %v, fsOpts: %+v", device, mountPoint, mountOptions, fsOpts)
+	log.Tracef(">>>>> MountDevicei xxxdevfsck, device: %+v, mountPoint: %s, mountOptions: %v, fsOpts: %+v", device, mountPoint, mountOptions, fsOpts)
+//	log.Tracef(">>>>> MountDevice, device: %+v, mountPoint: %s, mountOptions: %v, fsOpts: %+v", device, mountPoint, mountOptions, fsOpts)
 	defer log.Trace("<<<<< MountDevice")
 
 	// Setup FS if requested
